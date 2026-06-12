@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "world-cup-predictor"
+version = "0.1.0"
+description = ""
+authors = ["Eirik Bell-Mathiesen <eiribel@uio.no>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.12"
+numpy = "^2.4.6"
+matplotlib = "^3.11.0"
+pandas = "^3.0.3"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
