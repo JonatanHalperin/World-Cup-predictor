@@ -1,0 +1,40 @@
+football_name,world_bank_name,transfermarkt_country_name,notes
+England,United Kingdom,England,Home nation uses UK population proxy.
+Scotland,United Kingdom,Scotland,Home nation uses UK population proxy.
+Wales,United Kingdom,Wales,Home nation uses UK population proxy.
+Northern Ireland,United Kingdom,Northern Ireland,Home nation uses UK population proxy.
+Republic of Ireland,Ireland,Ireland,
+United States,United States,United States,
+South Korea,"Korea, Rep.","Korea, South",
+North Korea,"Korea, Dem. People's Rep.","Korea, North",
+Iran,"Iran, Islamic Rep.",Iran,
+Russia,Russian Federation,Russia,
+Czech Republic,Czechia,Czech Republic,
+Slovakia,Slovak Republic,Slovakia,
+Egypt,"Egypt, Arab Rep.",Egypt,
+Venezuela,"Venezuela, RB",Venezuela,
+DR Congo,"Congo, Dem. Rep.",Congo DR,
+Congo,"Congo, Rep.",Congo,
+Ivory Coast,Cote d'Ivoire,Cote d'Ivoire,
+Syria,Syrian Arab Republic,Syria,
+Laos,Lao PDR,Laos,
+Vietnam,Viet Nam,Vietnam,
+Yemen,"Yemen, Rep.",Yemen,
+Kyrgyzstan,Kyrgyz Republic,Kyrgyzstan,
+Cape Verde,Cabo Verde,Cape Verde,
+Brunei,Brunei Darussalam,Brunei Darussalam,
+Gambia,"Gambia, The",The Gambia,
+Bahamas,"Bahamas, The",Bahamas,
+Palestine,West Bank and Gaza,Palestine,
+Turkey,Turkiye,Türkiye,
+Bosnia and Herzegovina,Bosnia and Herzegovina,Bosnia-Herzegovina,
+South Sudan,South Sudan,Southern Sudan,
+Saint Kitts and Nevis,St. Kitts and Nevis,St. Kitts & Nevis,
+Saint Lucia,St. Lucia,St. Lucia,
+Hong Kong,"Hong Kong SAR, China",Hongkong,
+Macau,"Macao SAR, China",Macao,
+Taiwan,,Chinese Taipei,No World Bank country population match.
+Curaçao,,Curacao,No World Bank country population match.
+Tahiti,French Polynesia,Tahiti,
+New Caledonia,New Caledonia,Neukaledonien,
+Puerto Rico,Puerto Rico (US),Puerto Rico,
