@@ -6,60 +6,34 @@ It has two main modelling approaches:
 - A machine learning approach
 - A statistical approach
 
-The statistical approach is developed separately from the ML approach. The
-current statistical work is V1, which uses a generalized linear model (GLM) and
-a Poisson goal model.
+Shared data collection and processing lives in `data_pipeline/`. Some outputs in
+that folder are model-specific; files for the first statistical phase are marked
+as Statistical V1 in `data_pipeline/README.md`.
 
 ## Statistical Approach: V1
 
-Building a good football prediction model can become complex quickly. The aim
-of this first statistical phase is to lay the groundwork for future improvements
-while keeping the model simple, explainable, and easy to iterate on.
-
-In this phase, the project will:
-
-1. Find and prepare relevant match and team data.
-2. Fit a GLM using a Poisson model for goals scored.
-3. Present model results in a clear and reproducible way.
-
-The V1 statistical model is intended to be a baseline rather than a final
-predictor. It should make it easier to compare later statistical improvements
-against a simple foundation.
-
-## Planned Improvements
-
-After the first phase, the goal is to evolve the model by adding more advanced
-features such as:
-
-- Regularization
-- Time weighting
-- Elo-type team ratings
-- Bayesian uncertainty
-- Variational smoothing or related smoothing methods
-
-## Expected Outputs
-
-The initial version should produce:
-
-- Cleaned input data
-- Estimated team or match-level model parameters
-- Predicted goal expectations
-- Match outcome probabilities
-- A readable summary of results
+The first statistical phase uses a GLM/Poisson-style setup. The goal is to keep
+the baseline simple and reproducible while preparing match-level features that
+can later be improved with regularization, time weighting, Bayesian uncertainty,
+or other smoothing methods.
 
 ## Setup
 
-With Poetry:
+Poetry:
 
 ```bash
 poetry install
 poetry run python your_script.py
 ```
 
-Without Poetry:
+Non-Poetry:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python your_script.py
 ```
+
+Use the same pattern for project commands: replace `poetry run python ...` with
+`python ...` after activating the virtual environment.
