@@ -24,23 +24,38 @@ pip install -r requirements.txt
 pip install torch
 ```
 
-## Running Scripts
+## Data pipeline
+
+Generated data files are not committed. Use the Makefile to build or clean them:
+
+```bash
+make build-data              # build all data from committed raw files (offline)
+make build-data ARGS=--refresh  # re-download raw sources first, then build
+make clean-data              # remove all generated data files
+make clean-data ARGS=--cache # also wipe the downloaded external cache
+```
+
+After `make build-data`, train the ML V1 model:
+
+```bash
+poetry run python -m ML_V1.train_baseline
+# or without Poetry:
+python -m ML_V1.train_baseline
+```
+
+To validate the Statistical V1 processed outputs:
+
+```bash
+poetry run python data_pipeline/build_data.py --check
+```
+
+## Running prediction scripts
 
 All scripts must be run as **modules from the repo root** because of cross-package imports (`ML_V1/predict.py` imports from both `data_pipeline` and `ML_V1`):
 
 ```bash
-poetry run python -m data_pipeline.elo
-poetry run python -m data_pipeline.make_baseline_dataset
-poetry run python -m ML_V1.train_baseline
-poetry run python -m ML_V1.predict
-poetry run python -m ML_V1.predict_fixtures
-```
-
-The `data_pipeline/build_data.py` is the comprehensive Statistical V1 builder and supports flags:
-
-```bash
-poetry run python data_pipeline/build_data.py --refresh   # download fresh sources + build
-poetry run python data_pipeline/build_data.py --check     # validate existing processed files
+poetry run python -m ML_V1.predict           # predict a single named fixture
+poetry run python -m ML_V1.predict_fixtures  # predict all upcoming World Cup games
 ```
 
 ## Architecture
