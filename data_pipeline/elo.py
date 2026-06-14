@@ -157,7 +157,8 @@ def current_ratings_table(ratings: dict[str, float]) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    matches = load_results()
+    _local_raw = Path(__file__).resolve().parent / "raw" / "martj42" / "results.csv"
+    matches = load_results(str(_local_raw) if _local_raw.exists() else RESULTS_URL)
     feature_table, ratings = compute_elo(matches)
     _ML_V1_DATA_DIR.mkdir(parents=True, exist_ok=True)
     feature_table.to_csv(_ML_V1_DATA_DIR / "matches_with_elo.csv", index=False)
