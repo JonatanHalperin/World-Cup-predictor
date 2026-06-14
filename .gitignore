@@ -1,3 +1,4 @@
+# dev environment
 .venv/
 .WorldCup/
 __pycache__/
@@ -5,8 +6,15 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
-CLAUDE.md
-matches_with_elo.csv
-baseline_*.csv
-scaling.json
+
+# downloaded / cached external data
 data_pipeline/cache/
+
+# generated ML V1 data and model artifacts
+ML_V1/data/*.csv
+ML_V1/data/*.json
+ML_V1/data/*.pt
+
+# generated pipeline outputs
+data_pipeline/processed/
+world_cup_predictions.csv

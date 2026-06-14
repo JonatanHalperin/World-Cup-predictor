@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import difflib
 import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -30,17 +31,19 @@ import torch
 from data_pipeline.elo import load_results, compute_elo
 from ML_V1.train_baseline import PoissonNet, poisson_pmf_grid, GRID
 
+_DATA_DIR = Path(__file__).resolve().parent / "data"
+
 HOME_ADVANTAGE = 100.0  # must match elo.py / make_baseline_dataset.py
 
 
-def load_model(path: str = "baseline_model.pt") -> PoissonNet:
+def load_model(path: Path = _DATA_DIR / "baseline_model.pt") -> PoissonNet:
     model = PoissonNet()
     model.load_state_dict(torch.load(path))
     model.eval()
     return model
 
 
-def load_scaling(path: str = "scaling.json") -> dict:
+def load_scaling(path: Path = _DATA_DIR / "scaling.json") -> dict:
     with open(path) as f:
         return json.load(f)
 

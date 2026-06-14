@@ -17,11 +17,15 @@ Needs: torch, pandas, numpy
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+
+_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 FEATURES = ["team_elo_scaled", "opp_elo_scaled", "elo_diff_scaled", "is_home"]
 TARGET = "team_goals"
@@ -135,9 +139,9 @@ def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    x_tr, y_tr, df_tr = load_xy("baseline_train.csv")
-    x_va, y_va, df_va = load_xy("baseline_val.csv")
-    x_te, y_te, df_te = load_xy("baseline_test.csv")
+    x_tr, y_tr, df_tr = load_xy(_DATA_DIR / "baseline_train.csv")
+    x_va, y_va, df_va = load_xy(_DATA_DIR / "baseline_val.csv")
+    x_te, y_te, df_te = load_xy(_DATA_DIR / "baseline_test.csv")
 
     criterion = nn.PoissonNLLLoss(log_input=False, full=True)
     model = PoissonNet()
@@ -166,7 +170,7 @@ def main() -> None:
 
     model.load_state_dict(best_state)
     model.eval()
-    torch.save(model.state_dict(), "baseline_model.pt")  # reused by predict.py
+    torch.save(model.state_dict(), _DATA_DIR / "baseline_model.pt")  # reused by predict.py
     with torch.no_grad():
         test_nll = criterion(model(x_te), y_te).item()
         lams_te = model(x_te).numpy()

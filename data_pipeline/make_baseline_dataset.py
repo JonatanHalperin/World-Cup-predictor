@@ -14,15 +14,17 @@ The same row format will carry the full feature set later: adding features
 means adding columns, nothing else changes.
 
 Usage:
-    python make_baseline_dataset.py            # expects matches_with_elo.csv
-Outputs:
-    baseline_train.csv, baseline_val.csv, baseline_test.csv, scaling.json
+    python -m data_pipeline.make_baseline_dataset
+Inputs/outputs all live in ML_V1/data/.
 """
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pandas as pd
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "ML_V1" / "data"
 
 # ---- configuration -------------------------------------------------------
 MIN_DATE = "1960-01-01"      # drop the Elo burn-in era
@@ -77,7 +79,9 @@ def explode_to_perspectives(matches: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def build(matches_path: str = "matches_with_elo.csv") -> None:
+def build(matches_path: Path | None = None) -> None:
+    if matches_path is None:
+        matches_path = _DATA_DIR / "matches_with_elo.csv"
     matches = pd.read_csv(matches_path, parse_dates=["date"])
     matches = matches[matches["date"] >= MIN_DATE]
 
@@ -95,10 +99,11 @@ def build(matches_path: str = "matches_with_elo.csv") -> None:
         for c in SCALED_COLS:
             split[f"{c}_scaled"] = (split[c] - stats[c]["mean"]) / stats[c]["std"]
 
-    train.to_csv("baseline_train.csv", index=False)
-    val.to_csv("baseline_val.csv", index=False)
-    test.to_csv("baseline_test.csv", index=False)
-    with open("scaling.json", "w") as f:
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    train.to_csv(_DATA_DIR / "baseline_train.csv", index=False)
+    val.to_csv(_DATA_DIR / "baseline_val.csv", index=False)
+    test.to_csv(_DATA_DIR / "baseline_test.csv", index=False)
+    with open(_DATA_DIR / "scaling.json", "w") as f:
         json.dump(stats, f, indent=2)
 
     print(f"train: {len(train):>7,} rows  ({train['date'].min().date()} .. {train['date'].max().date()})")

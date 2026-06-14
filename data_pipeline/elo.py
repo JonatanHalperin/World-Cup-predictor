@@ -17,8 +17,11 @@ Typical use:
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 
 import pandas as pd
+
+_ML_V1_DATA_DIR = Path(__file__).resolve().parent.parent / "ML_V1" / "data"
 
 RESULTS_URL = (
     "https://raw.githubusercontent.com/martj42/"
@@ -156,7 +159,8 @@ def current_ratings_table(ratings: dict[str, float]) -> pd.DataFrame:
 if __name__ == "__main__":
     matches = load_results()
     feature_table, ratings = compute_elo(matches)
-    feature_table.to_csv("matches_with_elo.csv", index=False)
+    _ML_V1_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    feature_table.to_csv(_ML_V1_DATA_DIR / "matches_with_elo.csv", index=False)
     print(f"Computed Elo over {len(feature_table):,} played matches")
     print(f"Latest match: {feature_table['date'].max().date()}\n")
     print("Top 15 teams by current Elo:")
