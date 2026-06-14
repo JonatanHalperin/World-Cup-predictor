@@ -67,3 +67,32 @@ python your_script.py
 
 Use the same pattern for project commands: replace `poetry run python ...` with
 `python ...` after activating the virtual environment.
+
+## Data
+
+Generated data files are not committed. After setup, run:
+
+```bash
+make build-data
+```
+
+This builds all processed data in `data_pipeline/processed/` and the ML V1
+training splits in `ML_V1/data/`. Pass `--refresh` to re-download the raw
+source files before building:
+
+```bash
+make build-data ARGS=--refresh
+```
+
+To remove all generated data files:
+
+```bash
+make clean-data
+```
+
+Pass `--cache` to also wipe the downloaded external cache (Transfermarkt,
+World Bank), which requires `--refresh` on the next build:
+
+```bash
+make clean-data ARGS=--cache
+```
