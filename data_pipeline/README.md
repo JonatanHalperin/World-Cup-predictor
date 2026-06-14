@@ -145,6 +145,9 @@ Raw and reference files:
   time.
 - Elo: derived from martj42 results with the shared `elo.py` formula, starting
   in 1900 and exported for 1960+ matches.
+- Kyrre weight: Statistical V1 weights older GLM training rows by
+  `w_i = exp(-gamma * age_i)`. This is a model-fitting sample weight, not an
+  Elo rating column.
 - Transfermarkt/dcaribou exports: used to build yearly country player-value
   proxies.
 - World Bank population: used for yearly country population joins.

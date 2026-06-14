@@ -747,7 +747,14 @@ def write_processed_outputs(as_of_date: date) -> None:
     completed_history, completed, future = load_martj42_results(as_of_date)
     completed_history = add_elo_features(completed_history)
     completed = completed.merge(
-        completed_history[["source_match_id", "home_elo_pre", "away_elo_pre", "elo_diff"]],
+        completed_history[
+            [
+                "source_match_id",
+                "home_elo_pre",
+                "away_elo_pre",
+                "elo_diff",
+            ]
+        ],
         on="source_match_id",
         how="left",
     )
