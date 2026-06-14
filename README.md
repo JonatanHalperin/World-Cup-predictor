@@ -49,17 +49,21 @@ The initial version should produce:
 
 ## Setup
 
-With Poetry:
+Poetry:
 
 ```bash
 poetry install
 poetry run python your_script.py
 ```
 
-Without Poetry:
+Non-Poetry:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python your_script.py
 ```
+
+Use the same pattern for project commands: replace `poetry run python ...` with
+`python ...` after activating the virtual environment.

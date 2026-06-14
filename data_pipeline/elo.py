@@ -119,21 +119,23 @@ def compute_elo(
         g = goal_diff_multiplier(m.home_score - m.away_score)
         delta = k * g * (w_home - we_home)
 
-        rows.append(
-            {
-                "date": m.date,
-                "tournament": m.tournament,
-                "neutral": m.neutral,
-                "home_team": m.home_team,
-                "away_team": m.away_team,
-                "home_score": m.home_score,
-                "away_score": m.away_score,
-                "home_elo_pre": round(r_home, 2),
-                "away_elo_pre": round(r_away, 2),
-                # signed strength gap going into the match (your headline feature)
-                "elo_diff": round((r_home + adv) - r_away, 2),
-            }
-        )
+        row = {
+            "date": m.date,
+            "tournament": m.tournament,
+            "neutral": m.neutral,
+            "home_team": m.home_team,
+            "away_team": m.away_team,
+            "home_score": m.home_score,
+            "away_score": m.away_score,
+            "home_elo_pre": round(r_home, 2),
+            "away_elo_pre": round(r_away, 2),
+            # signed strength gap going into the match (your headline feature)
+            "elo_diff": round((r_home + adv) - r_away, 2),
+        }
+        for identifier in ("source_match_id", "match_id"):
+            if hasattr(m, identifier):
+                row[identifier] = getattr(m, identifier)
+        rows.append(row)
 
         # zero-sum update: home gains exactly what away loses
         ratings[m.home_team] = r_home + delta

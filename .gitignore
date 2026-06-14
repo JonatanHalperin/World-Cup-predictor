@@ -9,3 +9,4 @@ CLAUDE.md
 matches_with_elo.csv
 baseline_*.csv
 scaling.json
+data_pipeline/cache/
