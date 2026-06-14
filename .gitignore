@@ -5,3 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+CLAUDE.md
+matches_with_elo.csv
+baseline_*.csv
+scaling.json
