@@ -1,21 +1,16 @@
-"""Build the Elo-only baseline training dataset for the World Cup predictor.
+"""Build the ML training dataset from the shared processed features.
 
-Takes matches_with_elo.csv (produced by elo.py) and turns it into the
-per-team-perspective table the neural network trains on:
-
-  * two rows per match (one from each side's perspective)
-  * target = goals scored by that side (capped, for Poisson stability)
-  * inputs = team_elo, opp_elo, elo_diff (home-adjusted), is_home
-  * scaled copies of inputs, using TRAINING-set statistics only
-  * time-based train / val / test split (never random -- avoids leakage,
-    and guarantees both rows of a match land in the same split)
-
-The same row format will carry the full feature set later: adding features
-means adding columns, nothing else changes.
+Reads model_features_long.csv (produced by build_data.py), which already has
+one row per team-perspective and pre-imputed feature columns.  Adds opponent
+form and rest-day columns via a self-join on match_id, z-score-scales all
+continuous features using training-set statistics only, and writes:
+    ML_V1/data/baseline_{train,val,test}.csv
+    ML_V1/data/scaling.json
+    ML_V1/data/team_form.json   -- latest form values + last_game_date per team
+    ML_V1/data/h2h_table.json   -- latest H2H goal-diff per team pair
 
 Usage:
     python -m data_pipeline.make_baseline_dataset
-Inputs/outputs all live in ML_V1/data/.
 """
 from __future__ import annotations
 
@@ -25,93 +20,127 @@ from pathlib import Path
 import pandas as pd
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "ML_V1" / "data"
+_PIPELINE_DIR = Path(__file__).resolve().parent
 
 # ---- configuration -------------------------------------------------------
-MIN_DATE = "1960-01-01"      # drop the Elo burn-in era
-VAL_START = "2015-01-01"     # train:  MIN_DATE .. VAL_START
-TEST_START = "2020-01-01"    # val:    VAL_START .. TEST_START, test: after
-GOAL_CAP = 8                 # cap freak scorelines (31-0 etc.) for stability
-HOME_ADVANTAGE = 100.0       # must match the value used in elo.py
-SCALED_COLS = ["team_elo", "opp_elo", "elo_diff"]  # is_home is already 0/1
+MIN_DATE = "1960-01-01"
+VAL_START = "2015-01-01"    # train: MIN_DATE .. VAL_START
+TEST_START = "2020-01-01"   # val:   VAL_START .. TEST_START, test: after
+GOAL_CAP = 8                # cap freak scorelines for Poisson stability
+
+# Continuous features that get z-score normalised (training statistics only)
+SCALED_COLS = [
+    "team_elo", "opp_elo", "elo_diff",
+    "goals_for_avg_last_5", "goals_against_avg_last_5",
+    "opp_goals_for_avg_last_5", "opp_goals_against_avg_last_5",
+    "h2h_goal_diff_avg_60y",
+    "points_per_game_last_5", "opp_points_per_game_last_5",
+]
+# Binary features: is_home, is_competitive — already 0/1, no scaling needed
 # ---------------------------------------------------------------------------
 
 
-def explode_to_perspectives(matches: pd.DataFrame) -> pd.DataFrame:
-    """Turn one match row into two rows, one per team's perspective.
+def build(features_path: Path | None = None) -> None:
+    if features_path is None:
+        features_path = _PIPELINE_DIR / "processed" / "model_features_long.csv"
 
-    elo_diff includes the home-advantage offset for whichever side is at
-    home, mirroring how the Elo update itself treats venue.
-    """
-    home_adv = (~matches["neutral"]).astype(float) * HOME_ADVANTAGE
+    df = pd.read_csv(features_path, parse_dates=["date"])
+    df = df[df["date"] >= MIN_DATE].copy()
 
-    home_view = pd.DataFrame(
-        {
-            "date": matches["date"],
-            "tournament": matches["tournament"],
-            "team": matches["home_team"],
-            "opponent": matches["away_team"],
-            "is_home": (~matches["neutral"]).astype(int),
-            "team_elo": matches["home_elo_pre"],
-            "opp_elo": matches["away_elo_pre"],
-            "elo_diff": matches["home_elo_pre"] + home_adv - matches["away_elo_pre"],
-            "team_goals": matches["home_score"],
-            "opp_goals": matches["away_score"],
-        }
+    # Align to internal column convention used elsewhere in the ML pipeline
+    df = df.rename(columns={
+        "team_elo_pre": "team_elo",
+        "opp_elo_pre":  "opp_elo",
+        "goals_for":    "team_goals",
+        "goals_against":"opp_goals",
+    })
+
+    # Self-join on match_id+opponent to bring the opponent's recent form into
+    # the same row (needed so the model sees both attack/defence signals)
+    opp_cols = (
+        df[["match_id", "team", "goals_for_avg_last_5", "goals_against_avg_last_5",
+            "points_per_game_last_5"]]
+        .rename(columns={
+            "team": "opponent",
+            "goals_for_avg_last_5":    "opp_goals_for_avg_last_5",
+            "goals_against_avg_last_5":"opp_goals_against_avg_last_5",
+            "points_per_game_last_5":  "opp_points_per_game_last_5",
+        })
     )
-    away_view = pd.DataFrame(
-        {
-            "date": matches["date"],
-            "tournament": matches["tournament"],
-            "team": matches["away_team"],
-            "opponent": matches["home_team"],
-            "is_home": 0,  # the away side is never "at home"
-            "team_elo": matches["away_elo_pre"],
-            "opp_elo": matches["home_elo_pre"],
-            "elo_diff": matches["away_elo_pre"] - (matches["home_elo_pre"] + home_adv),
-            "team_goals": matches["away_score"],
-            "opp_goals": matches["home_score"],
-        }
-    )
-    return (
-        pd.concat([home_view, away_view], ignore_index=True)
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    df = df.merge(opp_cols, on=["match_id", "opponent"])
 
+    df["team_goals"] = df["team_goals"].clip(upper=GOAL_CAP)
+    df["opp_goals"]  = df["opp_goals"].clip(upper=GOAL_CAP)
 
-def build(matches_path: Path | None = None) -> None:
-    if matches_path is None:
-        matches_path = _DATA_DIR / "matches_with_elo.csv"
-    matches = pd.read_csv(matches_path, parse_dates=["date"])
-    matches = matches[matches["date"] >= MIN_DATE]
-
-    rows = explode_to_perspectives(matches)
-    rows["team_goals"] = rows["team_goals"].clip(upper=GOAL_CAP)
-    rows["opp_goals"] = rows["opp_goals"].clip(upper=GOAL_CAP)
+    keep = [
+        "date", "tournament", "team", "opponent",
+        "team_elo", "opp_elo", "elo_diff", "is_home", "is_competitive", "is_world_cup",
+        "goals_for_avg_last_5", "goals_against_avg_last_5",
+        "opp_goals_for_avg_last_5", "opp_goals_against_avg_last_5",
+        "h2h_goal_diff_avg_60y",
+        "points_per_game_last_5", "opp_points_per_game_last_5",
+        "team_goals", "opp_goals",
+    ]
+    rows = df[keep].sort_values("date").reset_index(drop=True)
 
     train = rows[rows["date"] < VAL_START]
-    val = rows[(rows["date"] >= VAL_START) & (rows["date"] < TEST_START)]
-    test = rows[rows["date"] >= TEST_START]
+    val   = rows[(rows["date"] >= VAL_START) & (rows["date"] < TEST_START)]
+    test  = rows[rows["date"] >= TEST_START]
 
-    # scale with TRAINING statistics only -- val/test must not influence them
-    stats = {c: {"mean": train[c].mean(), "std": train[c].std()} for c in SCALED_COLS}
+    # Compute scaling stats on training set only; apply to all splits
+    stats = {
+        c: {"mean": float(train[c].mean()), "std": float(train[c].std())}
+        for c in SCALED_COLS
+    }
     for split in (train, val, test):
         for c in SCALED_COLS:
             split[f"{c}_scaled"] = (split[c] - stats[c]["mean"]) / stats[c]["std"]
 
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
     train.to_csv(_DATA_DIR / "baseline_train.csv", index=False)
-    val.to_csv(_DATA_DIR / "baseline_val.csv", index=False)
-    test.to_csv(_DATA_DIR / "baseline_test.csv", index=False)
+    val.to_csv(  _DATA_DIR / "baseline_val.csv",   index=False)
+    test.to_csv( _DATA_DIR / "baseline_test.csv",  index=False)
     with open(_DATA_DIR / "scaling.json", "w") as f:
         json.dump(stats, f, indent=2)
+
+    # Persist latest form per team for use by predict.py at inference time
+    latest_by_team = rows.sort_values("date").groupby("team").last()
+    team_form = {
+        team: {
+            "goals_for_avg_last_5":    float(row["goals_for_avg_last_5"]),
+            "goals_against_avg_last_5":float(row["goals_against_avg_last_5"]),
+            "points_per_game_last_5":  float(row["points_per_game_last_5"]),
+            "last_game_date":          str(row["date"].date()),
+        }
+        for team, row in latest_by_team.iterrows()
+    }
+    with open(_DATA_DIR / "team_form.json", "w") as f:
+        json.dump(team_form, f, indent=2)
+
+    # Persist H2H goal-diff per (team, opponent) pair for inference
+    h2h_df = (
+        df[["date", "team", "opponent", "h2h_goal_diff_avg_60y"]]
+        .sort_values("date")
+        .groupby(["team", "opponent"])
+        .last()
+        .reset_index()
+    )
+    h2h_table = {
+        f"{row['team']}|{row['opponent']}": float(row["h2h_goal_diff_avg_60y"])
+        for _, row in h2h_df.iterrows()
+    }
+    with open(_DATA_DIR / "h2h_table.json", "w") as f:
+        json.dump(h2h_table, f, indent=2)
 
     print(f"train: {len(train):>7,} rows  ({train['date'].min().date()} .. {train['date'].max().date()})")
     print(f"val:   {len(val):>7,} rows  ({val['date'].min().date()} .. {val['date'].max().date()})")
     print(f"test:  {len(test):>7,} rows  ({test['date'].min().date()} .. {test['date'].max().date()})")
     print(f"\nmean goals per row (train): {train['team_goals'].mean():.3f}")
-    print("scaling stats written to scaling.json")
-    print("\nmodel inputs:  team_elo_scaled, opp_elo_scaled, elo_diff_scaled, is_home")
+    print(f"scaling stats   -> scaling.json")
+    print(f"team form       -> team_form.json  ({len(team_form)} teams, includes last_game_date)")
+    print(f"H2H table       -> h2h_table.json  ({len(h2h_table)} pairs)")
+    feature_cols = [f"{c}_scaled" for c in SCALED_COLS] + ["is_home", "is_competitive"]
+    print(f"\nmodel inputs ({len(feature_cols)}): {', '.join(feature_cols)}")
     print("target:        team_goals  (Poisson NLL)")
 
 

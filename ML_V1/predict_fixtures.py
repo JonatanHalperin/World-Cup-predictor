@@ -20,7 +20,7 @@ from __future__ import annotations
 import pandas as pd
 
 from data_pipeline.elo import RESULTS_URL, compute_elo, load_results
-from ML_V1.predict import load_model, load_scaling, predict_match
+from ML_V1.predict import load_ensemble, load_scaling, load_team_form, load_h2h_table, load_dc_rho, predict_match
 
 
 def load_scheduled_world_cup(source: str = RESULTS_URL) -> pd.DataFrame:
@@ -38,7 +38,11 @@ def load_scheduled_world_cup(source: str = RESULTS_URL) -> pd.DataFrame:
 def main() -> None:
     print("Loading latest Elo ratings...")
     _, ratings = compute_elo(load_results())
-    model, scaling = load_model(), load_scaling()
+    models    = load_ensemble()
+    scaling   = load_scaling()
+    team_form = load_team_form()
+    h2h_table = load_h2h_table()
+    rho       = load_dc_rho()
 
     fixtures = load_scheduled_world_cup()
     if fixtures.empty:
@@ -52,8 +56,9 @@ def main() -> None:
         home_team = None if f.neutral else f.home_team
         try:
             r = predict_match(
-                model, ratings, scaling,
+                models, ratings, scaling,
                 f.home_team, f.away_team, neutral=f.neutral, home=home_team,
+                is_competitive=True, team_form=team_form, h2h_table=h2h_table, rho=rho,
             )
         except KeyError:
             skipped += 1  # placeholder team (e.g. "Winner Group A") not yet known
