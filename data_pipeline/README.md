@@ -165,6 +165,24 @@ These are not implemented yet, but are documented as likely next sources:
 - Transfermarkt/dcaribou squad/player tables for fuller demographics such as
   age, caps, and top-league share.
 
+## Future V1 Data Improvements
+
+These are modeling/data ideas only. They are not implemented in the current V1
+tables, and no processed data columns are changed by the ridge/tuning work.
+
+- Weather, altitude, stadium coordinates, and travel distance for match-context
+  effects after historical backfill is available.
+- Bookmaker odds as a market benchmark, not as a default model feature unless
+  historical coverage and leakage rules are clear.
+- Lineups, injuries, suspensions, squad selection, and player availability for
+  player-strength adjustments.
+- Player value, age, caps, top-league share, and event/player-level data for
+  richer team quality signals.
+- Alternative team-strength ratings such as Pi-ratings or Berrar-style dynamic
+  ratings for future comparison against Elo.
+- Confederation, region, and tournament-specific context for subgroup bias and
+  drift analysis.
+
 ## Limitations
 
 - Transfermarkt values are approximate country/player-value proxies, not verified

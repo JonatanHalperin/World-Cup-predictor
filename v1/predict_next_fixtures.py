@@ -13,7 +13,9 @@ import numpy as np
 import pandas as pd
 
 try:
+    from .model_weights import model_weights_table, plot_model_weights
     from .poisson_glm import (
+        DEFAULT_RIDGE_ALPHA,
         fit_poisson_glm_from_data,
         outcome_probabilities,
         poisson_score_matrix,
@@ -34,9 +36,13 @@ try:
         slugify,
         top_scorelines,
         weighting_metadata,
+        regularization_metadata,
     )
+    from .tuning_config import DEFAULT_TUNED_CONFIG_PATH, load_tuned_config
 except ImportError:
+    from model_weights import model_weights_table, plot_model_weights
     from poisson_glm import (
+        DEFAULT_RIDGE_ALPHA,
         fit_poisson_glm_from_data,
         outcome_probabilities,
         poisson_score_matrix,
@@ -57,7 +63,9 @@ except ImportError:
         slugify,
         top_scorelines,
         weighting_metadata,
+        regularization_metadata,
     )
+    from tuning_config import DEFAULT_TUNED_CONFIG_PATH, load_tuned_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -260,9 +268,11 @@ def write_collective_report(
     top_scorelines_table: pd.DataFrame,
     model_training: pd.DataFrame,
     diagnostics: pd.DataFrame,
+    model_weights: pd.DataFrame,
     model_result,
     artifacts: dict[str, Path],
     as_of_date: str,
+    tuned_config_source: str,
 ) -> None:
     missing_from_source, available_not_modeled = missing_data_tables()
     feature_columns = list(getattr(model_result, "feature_columns", []))
@@ -314,6 +324,8 @@ def write_collective_report(
                 "training_end_date": pd.Timestamp(model_training["date"].max()).date().isoformat(),
                 **metadata,
                 **weights,
+                **regularization_metadata(model_result),
+                "tuned_config_source": tuned_config_source,
             }
         ]
     )
@@ -358,6 +370,25 @@ def write_collective_report(
         "",
         markdown_table(top_display, percent_columns={"probability"}),
         "",
+        "## Model Weights",
+        "",
+        "The chart `model_weights.png` shows standardized GLM coefficients:",
+        "`beta * training feature standard deviation`. Positive values increase",
+        "expected goals on the log scale; negative values decrease expected goals.",
+        "",
+        markdown_table(
+            model_weights[model_weights["term"].ne("const")].head(20)[
+                [
+                    "term",
+                    "coefficient",
+                    "std_error",
+                    "p_value",
+                    "standardized_coefficient",
+                    "rate_ratio_per_1sd",
+                ]
+            ]
+        ),
+        "",
         "## Model Diagnostics",
         "",
         f"- Log-likelihood: {model_result.llf:.6f}",
@@ -396,8 +427,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kyrre-weight-half-life-years",
         type=float,
-        default=DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS,
-        help="Half-life in years for Kyrre training weights. Defaults to 8.",
+        default=None,
+        help="Half-life in years for Kyrre training weights. Defaults to tuned config, then 8.",
     )
     parser.add_argument(
         "--kyrre-weight-gamma",
@@ -409,6 +440,23 @@ def parse_args() -> argparse.Namespace:
         "--no-kyrre-weight",
         action="store_true",
         help="Disable Kyrre-weighted likelihood fitting.",
+    )
+    parser.add_argument(
+        "--ridge-alpha",
+        type=float,
+        default=None,
+        help="L2 ridge penalty strength. Defaults to tuned config, then 0.01. Use 0 for unregularized GLM.",
+    )
+    parser.add_argument(
+        "--tuned-config",
+        type=Path,
+        default=DEFAULT_TUNED_CONFIG_PATH,
+        help="Path to tuned Poisson GLM hyperparameter config.",
+    )
+    parser.add_argument(
+        "--ignore-tuned-config",
+        action="store_true",
+        help="Ignore tuned config and use fallback defaults unless explicit flags are supplied.",
     )
     parser.add_argument(
         "--features",
@@ -424,6 +472,23 @@ def main() -> None:
     fixtures = pd.read_csv(args.fixtures_csv)
     training = pd.read_csv(args.training_csv)
     training["date"] = pd.to_datetime(training["date"], errors="coerce")
+    tuned_config = load_tuned_config(
+        args.tuned_config,
+        feature_columns=args.features,
+        ignore=args.ignore_tuned_config,
+    )
+    ridge_alpha = (
+        float(args.ridge_alpha)
+        if args.ridge_alpha is not None
+        else float(tuned_config.get("ridge_alpha", DEFAULT_RIDGE_ALPHA))
+    )
+    if args.no_kyrre_weight:
+        kyrre_half_life = None
+    elif args.kyrre_weight_half_life_years is not None:
+        kyrre_half_life = float(args.kyrre_weight_half_life_years)
+    else:
+        tuned_half_life = tuned_config.get("kyrre_weight_half_life_years", DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS)
+        kyrre_half_life = None if tuned_half_life is None else float(tuned_half_life)
     selected = select_next_world_cup_fixtures(
         fixtures,
         as_of_date=args.as_of_date,
@@ -437,9 +502,8 @@ def main() -> None:
         id_columns=["match_id", "team", "opponent"],
         date_column="date",
         kyrre_weight_gamma=None if args.no_kyrre_weight else args.kyrre_weight_gamma,
-        kyrre_weight_half_life_years=(
-            None if args.no_kyrre_weight else args.kyrre_weight_half_life_years
-        ),
+        kyrre_weight_half_life_years=kyrre_half_life,
+        ridge_alpha=ridge_alpha,
     )
 
     prediction_rows = []
@@ -472,22 +536,29 @@ def main() -> None:
         "outcome_probabilities_png": output_dir / "outcome_probabilities.png",
         "expected_goals_png": output_dir / "expected_goals.png",
         "best_outcomes_png": output_dir / "best_outcomes.png",
+        "model_weights_csv": output_dir / "model_weights.csv",
+        "model_weights_png": output_dir / "model_weights.png",
     }
 
+    weights = model_weights_table(model_result)
     fixture_predictions.to_csv(artifacts["fixture_predictions_csv"], index=False)
     top_scorelines_table.to_csv(artifacts["top_scorelines_csv"], index=False)
+    weights.to_csv(artifacts["model_weights_csv"], index=False)
     plot_outcome_probabilities(fixture_predictions, artifacts["outcome_probabilities_png"])
     plot_expected_goals(fixture_predictions, artifacts["expected_goals_png"])
     plot_best_outcomes(fixture_predictions, artifacts["best_outcomes_png"])
+    plot_model_weights(weights, artifacts["model_weights_png"])
     write_collective_report(
         output_dir=output_dir,
         fixture_predictions=fixture_predictions,
         top_scorelines_table=top_scorelines_table,
         model_training=training,
         diagnostics=model_diagnostics_table(model_result),
+        model_weights=weights,
         model_result=model_result,
         artifacts=artifacts,
         as_of_date=args.as_of_date,
+        tuned_config_source=str(tuned_config.get("source", "")),
     )
 
     print("\nNext World Cup fixture predictions")
@@ -511,6 +582,11 @@ def main() -> None:
     for column in ["home_win_probability", "draw_probability", "away_win_probability"]:
         display[column] = display[column].map(format_probability)
     print(display.to_string(index=False, float_format=lambda value: f"{value:.3f}"))
+    print("\nLargest standardized model weights")
+    top_weights = weights[weights["term"].ne("const")].head(12)[
+        ["term", "coefficient", "standardized_coefficient", "rate_ratio_per_1sd", "p_value"]
+    ]
+    print(top_weights.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
     print("\nReport artifacts")
     for name, path in artifacts.items():
         print(f"  {name}: {path}")

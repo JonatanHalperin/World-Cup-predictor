@@ -1,0 +1,63 @@
+{
+  "feature_columns": [
+    "team_elo_pre",
+    "opp_elo_pre",
+    "is_home",
+    "is_neutral",
+    "team_is_host",
+    "opponent_is_host",
+    "missing_days_since_last_match",
+    "days_since_last_match",
+    "prev_match_went_to_shootout",
+    "matches_last_30d",
+    "matches_last_60d",
+    "matches_last_365d",
+    "unbeaten_streak_pre",
+    "winless_streak_pre",
+    "is_friendly",
+    "is_qualifier",
+    "is_world_cup",
+    "is_continental",
+    "matches_available_last_5",
+    "points_per_game_last_5",
+    "goals_for_avg_last_5",
+    "goals_against_avg_last_5",
+    "matches_available_last_10",
+    "points_per_game_last_10",
+    "goals_for_avg_last_10",
+    "goals_against_avg_last_10",
+    "h2h_matches_60y",
+    "h2h_goal_diff_avg_60y",
+    "h2h_points_per_game_60y",
+    "missing_h2h_60y"
+  ],
+  "feature_list_hash": "47d211cd794ef47f",
+  "fit_method": "ridge_regularized_poisson_glm",
+  "kyrre_weight_gamma": null,
+  "kyrre_weight_half_life_years": null,
+  "kyrre_weight_label": "no_weight",
+  "model": "poisson_glm",
+  "ridge_alpha": 0.003,
+  "selected_metrics": {
+    "mean_outcome_log_loss": 0.8896642526224467,
+    "mean_poisson_nll": 1.427375320796372,
+    "mean_rps": 0.17362675425638582,
+    "outcome_accuracy": 0.5872406350136019
+  },
+  "selection_metric": "mean_outcome_log_loss",
+  "selection_policy": "within_log_loss_tolerance_then_rps_then_poisson_nll",
+  "selection_tiebreakers": [
+    "mean_rps",
+    "mean_poisson_nll"
+  ],
+  "selection_tolerance": 5e-05,
+  "tuning_date": "2026-06-14",
+  "validation_years": [
+    2016,
+    2017,
+    2018,
+    2019,
+    2020,
+    2021
+  ]
+}

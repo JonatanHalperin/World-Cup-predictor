@@ -11,12 +11,15 @@ log(lambda_i) = eta_i
 eta_i = X_i beta
 ```
 
-`statsmodels` estimates `beta` by weighted maximum likelihood. Prediction
-returns `eta = X beta` and `lambda = exp(eta)`, where `lambda` is expected
-goals.
+`statsmodels` estimates `beta` with the same Poisson GLM likelihood and an L2
+ridge penalty by default. Prediction returns `eta = X beta` and
+`lambda = exp(eta)`, where `lambda` is expected goals.
 
-V1 defaults now use regular Elo plus an 8-year Kyrre-weight half-life on
-training rows:
+Prediction scripts use regular Elo plus tuned sample-weighting and ridge
+strength from `v1/config/tuned_poisson_glm.json`. The targeted second tuning run
+can select a Kyrre half-life or `no_weight`. The current tracked config selects
+`no_weight` and ridge alpha `0.003`. If that config is unavailable, the fallback
+is an 8-year Kyrre-weight half-life and ridge alpha `0.01`:
 
 ```text
 w_i = exp(-gamma * age_i)
@@ -54,8 +57,10 @@ The stored fixture order is `Qatar vs Switzerland`, fixture `6`, on
 order and reports the stored fixture order.
 
 Fixture predictions train on the full completed dataset by default.
-Training rows use the Kyrre weight by default; pass `--no-kyrre-weight` to
-disable this or `--kyrre-weight-half-life-years` to tune the half-life.
+Training rows use the tuned sample-weighting choice and ridge alpha by default.
+Pass `--ignore-tuned-config` to use fallback defaults, `--ridge-alpha` to
+override regularization, `--kyrre-weight-half-life-years` to force a half-life,
+or `--no-kyrre-weight` to force unweighted fitting.
 
 Predict the next 10 unresolved 2026 World Cup fixtures and write a collective
 report:
@@ -77,6 +82,8 @@ Single-fixture artifacts include:
 - `outcome_probabilities.png`
 - `top_scorelines.png`
 - `expected_goals.png`
+- `model_weights.csv`
+- `model_weights.png`
 
 Collective next-fixture artifacts include:
 
@@ -86,6 +93,8 @@ Collective next-fixture artifacts include:
 - `outcome_probabilities.png`
 - `expected_goals.png`
 - `best_outcomes.png`
+- `model_weights.csv`
+- `model_weights.png`
 
 Refresh the source data used by the current model with:
 
@@ -99,6 +108,20 @@ missing or not yet modeled. Weather is intentionally not used until comparable
 historical weather is backfilled for the training rows.
 
 ## Validation And Test
+
+Tune Kyrre half-life/no-weight and ridge alpha with rolling expanding-window
+validation:
+
+```bash
+poetry run python v1/tune_hyperparameters.py
+```
+
+The tuning report is written to `v1/reports/hyperparameter_tuning/`, and the
+selected defaults are written to tracked config
+`v1/config/tuned_poisson_glm.json`.
+The tuner treats configs within `0.00005` mean log-loss of the best grid row as
+effectively tied, then chooses by RPS and Poisson NLL. This avoids chasing tiny
+noise-level differences in the fourth decimal.
 
 Run the fixed historical validation setup:
 
@@ -117,6 +140,10 @@ predictions, fixed-width predicted-lambda calibration tables, and PNG plots.
 The calibration table groups predicted expected goals into bins, then compares
 average predicted goals against average actual goals. The default bin width is
 `0.5`; tune it with `--calibration-bin-width`.
+The report also includes ridge metadata, RPS, Poisson deviance, outcome ECE,
+per-outcome precision/recall, reliability curves, subgroup/yearly breakdowns,
+baseline comparisons, paired tests, scoreline confusion summaries, and
+`model_weights.png` / `model_weights.csv`.
 
 ## API Usage
 
@@ -140,6 +167,7 @@ result = fit_poisson_glm(
     target_column="goals_for",
     id_columns=["match_id", "team", "opponent"],
     kyrre_weight_half_life_years=8,
+    ridge_alpha=0.01,
 )
 
 predictions = predict_expected_goals(result, new_rows)
@@ -152,9 +180,10 @@ outcomes = outcome_probabilities(score_matrix)
 
 Feature columns must be supplied explicitly. This code does not invent features,
 encode categoricals, scale columns, or create model inputs beyond adding the GLM
-intercept. Kyrre weights are enabled by default; pass
-`kyrre_weight_half_life_years=None` in Python or `--no-kyrre-weight` in the CLI
-to fit an unweighted likelihood.
+intercept. The lower-level Python fit defaults still use the fallback
+Kyrre-weight half-life and ridge regularization; pass
+`kyrre_weight_half_life_years=None` / `ridge_alpha=0` in Python or
+`--no-kyrre-weight` / `--ridge-alpha 0` in the CLI to disable either part.
 
 ## CLI Fit
 
@@ -164,5 +193,6 @@ You can also fit from the module CLI:
 poetry run python v1/poisson_glm.py \
   data_pipeline/processed/poisson_training_long.csv \
   --target goals_for \
-  --features team_elo_pre opp_elo_pre is_home
+  --features team_elo_pre opp_elo_pre is_home \
+  --ridge-alpha 0.01
 ```

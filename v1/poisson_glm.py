@@ -17,6 +17,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.special import gammaln
 from scipy.stats import poisson
 import statsmodels.api as sm
 from statsmodels.genmod.generalized_linear_model import GLMResultsWrapper
@@ -24,6 +25,7 @@ from statsmodels.genmod.generalized_linear_model import GLMResultsWrapper
 
 DAYS_PER_YEAR = 365.25
 DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS = 8.0
+DEFAULT_RIDGE_ALPHA = 0.01
 
 
 def _as_list(columns: Iterable[str] | None) -> list[str]:
@@ -64,9 +66,18 @@ def _numeric_frame(data: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         ) from exc
 
 
-def _design_matrix(data: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
+def _design_matrix(
+    data: pd.DataFrame,
+    feature_columns: list[str],
+    feature_means: pd.Series | None = None,
+    feature_scales: pd.Series | None = None,
+) -> pd.DataFrame:
     """Build X and add the intercept term used by eta = X beta."""
     features = _numeric_frame(data, feature_columns)
+    if feature_means is not None and feature_scales is not None:
+        means = pd.Series(feature_means, index=feature_columns, dtype=float)
+        scales = pd.Series(feature_scales, index=feature_columns, dtype=float).replace(0, 1.0)
+        features = (features - means) / scales
     return sm.add_constant(features, has_constant="add")
 
 
@@ -120,6 +131,52 @@ def _validated_weights(sample_weights: Iterable[float] | pd.Series, index: pd.In
     return weights
 
 
+def _validated_ridge_alpha(ridge_alpha: float | None) -> float:
+    if ridge_alpha is None:
+        return DEFAULT_RIDGE_ALPHA
+    ridge_alpha = float(ridge_alpha)
+    if not np.isfinite(ridge_alpha) or ridge_alpha < 0:
+        raise ValueError("ridge_alpha must be finite and non-negative.")
+    return ridge_alpha
+
+
+def _coerce_series(values: object, index: pd.Index, name: str) -> pd.Series:
+    if values is None:
+        return pd.Series(np.nan, index=index, name=name, dtype=float)
+    return pd.Series(values, index=index, name=name, dtype=float)
+
+
+def _poisson_fit_metrics(y: pd.Series, mu: np.ndarray, weights: pd.Series | None, parameter_count: int) -> dict[str, float]:
+    y_values = y.to_numpy(dtype=float)
+    mu_values = np.asarray(mu, dtype=float)
+    if not np.isfinite(mu_values).all() or (mu_values <= 0).any():
+        raise ValueError("Fitted Poisson means must be finite and positive.")
+    weight_values = np.ones_like(y_values) if weights is None else weights.to_numpy(dtype=float)
+    log_likelihood_obs = y_values * np.log(mu_values) - mu_values - gammaln(y_values + 1.0)
+    log_likelihood = float(np.sum(weight_values * log_likelihood_obs))
+    y_log_term = np.zeros_like(y_values, dtype=float)
+    positive = y_values > 0
+    y_log_term[positive] = y_values[positive] * np.log(y_values[positive] / mu_values[positive])
+    deviance = float(2.0 * np.sum(weight_values * (y_log_term - (y_values - mu_values))))
+    return {
+        "llf": log_likelihood,
+        "aic": float(2.0 * parameter_count - 2.0 * log_likelihood),
+        "deviance": deviance,
+    }
+
+
+def model_diagnostics_frame(model_result: GLMResultsWrapper) -> pd.DataFrame:
+    params = pd.Series(model_result.params, dtype=float)
+    return pd.DataFrame(
+        {
+            "term": params.index,
+            "coefficient": params.values,
+            "std_error": _coerce_series(getattr(model_result, "bse", None), params.index, "std_error").values,
+            "p_value": _coerce_series(getattr(model_result, "pvalues", None), params.index, "p_value").values,
+        }
+    )
+
+
 def load_model_data(
     csv_path: str | Path,
     feature_columns: Iterable[str],
@@ -143,19 +200,24 @@ def load_model_data(
 
 def print_model_diagnostics(model_result: GLMResultsWrapper) -> None:
     """Print the key maximum-likelihood diagnostics for the fitted GLM."""
-    diagnostics = pd.DataFrame(
-        {
-            "coefficient": model_result.params,
-            "std_error": model_result.bse,
-            "p_value": model_result.pvalues,
-        }
-    )
+    diagnostics = model_diagnostics_frame(model_result).set_index("term")
 
     print("\nCoefficient estimates")
     print(diagnostics.to_string(float_format=lambda value: f"{value: .6f}"))
     print(f"\nLog-likelihood: {model_result.llf: .6f}")
     print(f"AIC:            {model_result.aic: .6f}")
     print(f"Deviance:       {model_result.deviance: .6f}")
+    regularization_summary = getattr(model_result, "regularization_summary", None)
+    if regularization_summary:
+        print("\nRegularization")
+        print(
+            pd.DataFrame([regularization_summary]).to_string(
+                index=False,
+                float_format=lambda value: f"{value: .6f}",
+            )
+        )
+        if regularization_summary.get("ridge_alpha", 0) > 0:
+            print("Standard errors and p-values are not available for ridge-regularized fits.")
     weight_summary = getattr(model_result, "sample_weight_summary", None)
     if weight_summary:
         print("\nSample weights")
@@ -178,6 +240,7 @@ def fit_poisson_glm(
     kyrre_weight_gamma: float | None = None,
     kyrre_weight_half_life_years: float | None = DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS,
     kyrre_weight_reference_date: str | pd.Timestamp | None = None,
+    ridge_alpha: float | None = DEFAULT_RIDGE_ALPHA,
 ) -> GLMResultsWrapper:
     """Load a CSV and fit a Poisson GLM with a log link."""
     feature_columns = _as_list(feature_columns)
@@ -194,6 +257,7 @@ def fit_poisson_glm(
         kyrre_weight_gamma=kyrre_weight_gamma,
         kyrre_weight_half_life_years=kyrre_weight_half_life_years,
         kyrre_weight_reference_date=kyrre_weight_reference_date,
+        ridge_alpha=ridge_alpha,
     )
 
 
@@ -208,6 +272,7 @@ def fit_poisson_glm_from_data(
     kyrre_weight_gamma: float | None = None,
     kyrre_weight_half_life_years: float | None = DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS,
     kyrre_weight_reference_date: str | pd.Timestamp | None = None,
+    ridge_alpha: float | None = DEFAULT_RIDGE_ALPHA,
 ) -> GLMResultsWrapper:
     """Fit a Poisson GLM with a log link using maximum likelihood.
 
@@ -233,7 +298,15 @@ def fit_poisson_glm_from_data(
 
     # X beta is the linear predictor eta. The Poisson log link maps eta to
     # lambda with exp(eta), guaranteeing positive expected goals.
-    x = _design_matrix(data, feature_columns)
+    ridge_alpha = _validated_ridge_alpha(ridge_alpha)
+    standardize_features = ridge_alpha > 0
+    feature_means = None
+    feature_scales = None
+    if standardize_features:
+        raw_features = _numeric_frame(data, feature_columns)
+        feature_means = raw_features.mean()
+        feature_scales = raw_features.std(ddof=0).replace(0, 1.0)
+    x = _design_matrix(data, feature_columns, feature_means, feature_scales)
     weights = None
     weight_metadata: dict[str, object] = {}
     if sample_weights is not None:
@@ -268,7 +341,22 @@ def fit_poisson_glm_from_data(
         }
 
     model = sm.GLM(y, x, family=sm.families.Poisson(), freq_weights=weights)
-    result = model.fit()
+    if ridge_alpha > 0:
+        # Keep the intercept unpenalized and apply L2 shrinkage to feature
+        # weights. The likelihood and link remain the same Poisson GLM.
+        penalty = np.full(x.shape[1], ridge_alpha, dtype=float)
+        penalty[0] = 0.0
+        result = model.fit_regularized(alpha=penalty, L1_wt=0.0, maxiter=500)
+        result.bse = pd.Series(np.nan, index=x.columns, dtype=float)
+        result.pvalues = pd.Series(np.nan, index=x.columns, dtype=float)
+    else:
+        result = model.fit()
+
+    fitted_mu = np.exp(x.to_numpy(dtype=float).dot(pd.Series(result.params, index=x.columns).to_numpy(dtype=float)))
+    fit_metrics = _poisson_fit_metrics(y, fitted_mu, weights, len(x.columns))
+    result.llf = fit_metrics["llf"]
+    result.aic = fit_metrics["aic"]
+    result.deviance = fit_metrics["deviance"]
 
     # Store the training schema on the result so prediction can rebuild X in the
     # same column order, including the intercept.
@@ -276,6 +364,15 @@ def fit_poisson_glm_from_data(
     result.design_columns = x.columns.tolist()
     result.target_column = target_column
     result.id_columns = id_columns
+    result.regularization_summary = {
+        "fit_method": "ridge_regularized_poisson_glm" if ridge_alpha > 0 else "maximum_likelihood_poisson_glm",
+        "ridge_alpha": float(ridge_alpha),
+        "intercept_penalized": False,
+        "features_standardized": bool(standardize_features),
+    }
+    result.feature_means = None if feature_means is None else feature_means.copy()
+    result.feature_scales = None if feature_scales is None else feature_scales.copy()
+    result.standardize_features = bool(standardize_features)
     if weights is not None:
         result.sample_weights = weights.copy()
         result.sample_weight_summary = {
@@ -307,7 +404,12 @@ def predict_expected_goals(model_result: GLMResultsWrapper, new_data: pd.DataFra
         id_columns=None,
     )
 
-    x = _design_matrix(new_data, feature_columns)
+    x = _design_matrix(
+        new_data,
+        feature_columns,
+        getattr(model_result, "feature_means", None),
+        getattr(model_result, "feature_scales", None),
+    )
     x = x.reindex(columns=design_columns)
     if x.isna().any().any():
         raise ValueError("Prediction design matrix does not match the fitted model columns.")
@@ -401,6 +503,12 @@ def _parse_args() -> argparse.Namespace:
         help='Date column for Kyrre weighting. Defaults to "date".',
     )
     parser.add_argument(
+        "--ridge-alpha",
+        type=float,
+        default=DEFAULT_RIDGE_ALPHA,
+        help="L2 ridge penalty strength. Defaults to 0.01; use 0 for unregularized maximum likelihood.",
+    )
+    parser.add_argument(
         "--no-kyrre-weight",
         action="store_true",
         help="Disable Kyrre-weighted likelihood fitting.",
@@ -420,6 +528,7 @@ def main() -> None:
         kyrre_weight_half_life_years=(
             None if args.no_kyrre_weight else args.kyrre_weight_half_life_years
         ),
+        ridge_alpha=args.ridge_alpha,
     )
 
 

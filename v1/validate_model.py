@@ -11,24 +11,31 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import poisson
+from scipy.stats import chi2, poisson, ttest_rel, wilcoxon
+import statsmodels.api as sm
 
 try:
+    from .model_weights import model_weights_table, plot_model_weights
     from .poisson_glm import (
         DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS,
+        DEFAULT_RIDGE_ALPHA,
         fit_poisson_glm_from_data,
         outcome_probabilities,
         poisson_score_matrix,
         predict_expected_goals,
     )
+    from .tuning_config import DEFAULT_TUNED_CONFIG_PATH, load_tuned_config
 except ImportError:
+    from model_weights import model_weights_table, plot_model_weights
     from poisson_glm import (
         DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS,
+        DEFAULT_RIDGE_ALPHA,
         fit_poisson_glm_from_data,
         outcome_probabilities,
         poisson_score_matrix,
         predict_expected_goals,
     )
+    from tuning_config import DEFAULT_TUNED_CONFIG_PATH, load_tuned_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +90,80 @@ EPSILON = 1e-15
 
 def format_probability(value: float) -> str:
     return f"{value:.3%}"
+
+
+def safe_probability(value: float) -> float:
+    return float(np.clip(value, EPSILON, 1.0))
+
+
+def outcome_probability_column(outcome: str) -> str:
+    return {
+        "home_win": "home_win_probability",
+        "draw": "draw_probability",
+        "away_win": "away_win_probability",
+    }[outcome]
+
+
+def ranked_probability_score(probabilities: dict[str, float], actual: str) -> float:
+    predicted = np.array([probabilities[outcome] for outcome in OUTCOME_ORDER], dtype=float)
+    predicted = predicted / predicted.sum()
+    observed = np.array([float(outcome == actual) for outcome in OUTCOME_ORDER], dtype=float)
+    return float(np.mean((np.cumsum(predicted)[:-1] - np.cumsum(observed)[:-1]) ** 2))
+
+
+def poisson_deviance(actual: pd.Series | np.ndarray, predicted: pd.Series | np.ndarray) -> np.ndarray:
+    actual_values = np.asarray(actual, dtype=float)
+    predicted_values = np.asarray(predicted, dtype=float)
+    terms = np.zeros_like(actual_values, dtype=float)
+    positive = actual_values > 0
+    terms[positive] = actual_values[positive] * np.log(actual_values[positive] / predicted_values[positive])
+    return 2.0 * (terms - (actual_values - predicted_values))
+
+
+def outcome_ece(match_predictions: pd.DataFrame, bins: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
+    reliability_rows = []
+    ece_rows = []
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    for outcome in OUTCOME_ORDER:
+        probabilities = match_predictions[outcome_probability_column(outcome)].to_numpy(dtype=float)
+        actual = match_predictions["actual_outcome"].eq(outcome).astype(float).to_numpy()
+        class_ece = 0.0
+        for index in range(bins):
+            lower = edges[index]
+            upper = edges[index + 1]
+            if index == bins - 1:
+                mask = (probabilities >= lower) & (probabilities <= upper)
+            else:
+                mask = (probabilities >= lower) & (probabilities < upper)
+            count = int(mask.sum())
+            if count == 0:
+                continue
+            mean_predicted = float(probabilities[mask].mean())
+            empirical_frequency = float(actual[mask].mean())
+            gap = abs(empirical_frequency - mean_predicted)
+            class_ece += count / len(match_predictions) * gap
+            reliability_rows.append(
+                {
+                    "outcome": outcome,
+                    "bin_lower": lower,
+                    "bin_upper": upper,
+                    "matches": count,
+                    "mean_predicted_probability": mean_predicted,
+                    "empirical_frequency": empirical_frequency,
+                    "calibration_gap": empirical_frequency - mean_predicted,
+                    "absolute_calibration_gap": gap,
+                }
+            )
+        ece_rows.append({"outcome": outcome, "ece": class_ece})
+    ece = pd.DataFrame(ece_rows)
+    ece = pd.concat(
+        [
+            ece,
+            pd.DataFrame([{"outcome": "macro_average", "ece": float(ece["ece"].mean())}]),
+        ],
+        ignore_index=True,
+    )
+    return pd.DataFrame(reliability_rows), ece
 
 
 def markdown_table(df: pd.DataFrame, percent_columns: set[str] | None = None) -> str:
@@ -190,8 +271,16 @@ def add_row_predictions(model_result, evaluation: pd.DataFrame) -> pd.DataFrame:
     rows["actual_goals"] = rows["goals_for"].astype(int)
     rows["predicted_goals"] = rows["lambda"]
     rows["poisson_nll"] = -poisson.logpmf(rows["actual_goals"], rows["predicted_goals"])
+    rows["poisson_deviance"] = poisson_deviance(rows["actual_goals"], rows["predicted_goals"])
     rows["absolute_error"] = (rows["actual_goals"] - rows["predicted_goals"]).abs()
     rows["squared_error"] = (rows["actual_goals"] - rows["predicted_goals"]) ** 2
+    rows["within_one_goal"] = rows["absolute_error"].le(1.0).astype(int)
+    rows["goal_interval_95_lower"] = poisson.ppf(0.025, rows["predicted_goals"]).astype(int)
+    rows["goal_interval_95_upper"] = poisson.ppf(0.975, rows["predicted_goals"]).astype(int)
+    rows["goal_interval_95_contains"] = (
+        rows["actual_goals"].ge(rows["goal_interval_95_lower"])
+        & rows["actual_goals"].le(rows["goal_interval_95_upper"])
+    ).astype(int)
     return rows
 
 
@@ -244,13 +333,28 @@ def build_match_predictions(row_predictions: pd.DataFrame, max_goals: int) -> pd
         actual_outcome_probability = normalized_outcomes[observed_outcome]
         one_hot = {outcome: float(outcome == observed_outcome) for outcome in OUTCOME_ORDER}
         brier = sum((normalized_outcomes[outcome] - one_hot[outcome]) ** 2 for outcome in OUTCOME_ORDER)
+        rps = ranked_probability_score(normalized_outcomes, observed_outcome)
+        scoreline_abs_error = abs(actual_home_goals - top_home_goals) + abs(actual_away_goals - top_away_goals)
+        scoreline_within_one_goal = int(
+            abs(actual_home_goals - top_home_goals) <= 1
+            and abs(actual_away_goals - top_away_goals) <= 1
+        )
+        home_elo_diff = float(home_row["elo_diff"]) if "elo_diff" in home_row else np.nan
+        favorite_bucket = "home_favorite" if home_elo_diff > 50 else "away_favorite" if home_elo_diff < -50 else "close"
 
         rows.append(
             {
                 "match_id": int(match_id),
                 "date": home_row["date"],
+                "year": int(pd.Timestamp(home_row["date"]).year),
                 "home_team": home_row["home_team"],
                 "away_team": home_row["away_team"],
+                "tournament": home_row.get("tournament", ""),
+                "tournament_type": home_row.get("tournament_type", ""),
+                "is_neutral": int(home_row.get("is_neutral", 0)),
+                "is_world_cup": int(home_row.get("is_world_cup", 0)),
+                "home_elo_diff": home_elo_diff,
+                "favorite_bucket": favorite_bucket,
                 "actual_home_goals": actual_home_goals,
                 "actual_away_goals": actual_away_goals,
                 "predicted_home_goals": home_lambda,
@@ -264,14 +368,19 @@ def build_match_predictions(row_predictions: pd.DataFrame, max_goals: int) -> pd
                 "actual_outcome_probability": actual_outcome_probability,
                 "outcome_log_loss": -np.log(max(actual_outcome_probability, EPSILON)),
                 "outcome_brier_score": brier,
+                "rps": rps,
                 "outcome_correct": int(predicted_outcome == observed_outcome),
                 "top_scoreline": f"{top_home_goals}-{top_away_goals}",
+                "top_home_goals": top_home_goals,
+                "top_away_goals": top_away_goals,
                 "top_scoreline_probability": top_score_probability,
                 "actual_scoreline": f"{actual_home_goals}-{actual_away_goals}",
                 "exact_score_probability": exact_score_probability,
                 "exact_score_top1_correct": int(
                     top_home_goals == actual_home_goals and top_away_goals == actual_away_goals
                 ),
+                "scoreline_abs_error": scoreline_abs_error,
+                "scoreline_within_one_goal": scoreline_within_one_goal,
             }
         )
     return pd.DataFrame(rows).sort_values(["date", "match_id"]).reset_index(drop=True)
@@ -330,6 +439,251 @@ def build_goal_calibration(row_predictions: pd.DataFrame, bin_width: float = 0.5
     ]
 
 
+def build_match_context(data: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for match_id, group in data.groupby("match_id", sort=False):
+        home = group[group["is_listed_home"].eq(1)]
+        away = group[group["is_listed_home"].eq(0)]
+        if len(home) != 1 or len(away) != 1:
+            raise ValueError(f"match_id {match_id} must have one listed-home and one listed-away row.")
+        home_row = home.iloc[0]
+        away_row = away.iloc[0]
+        actual_home_goals = int(home_row["goals_for"])
+        actual_away_goals = int(away_row["goals_for"])
+        observed = actual_outcome(actual_home_goals, actual_away_goals)
+        rows.append(
+            {
+                "match_id": int(match_id),
+                "date": home_row["date"],
+                "year": int(pd.Timestamp(home_row["date"]).year),
+                "home_team": home_row["home_team"],
+                "away_team": home_row["away_team"],
+                "actual_home_goals": actual_home_goals,
+                "actual_away_goals": actual_away_goals,
+                "actual_outcome": observed,
+                "actual_scoreline": f"{actual_home_goals}-{actual_away_goals}",
+                "home_elo_diff": float(home_row["elo_diff"]) if "elo_diff" in home_row else 0.0,
+                "is_neutral": int(home_row.get("is_neutral", 0)),
+                "is_world_cup": int(home_row.get("is_world_cup", 0)),
+                "tournament_type": home_row.get("tournament_type", ""),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["date", "match_id"]).reset_index(drop=True)
+
+
+def finalize_baseline_predictions(
+    baseline_name: str,
+    context: pd.DataFrame,
+    probabilities: pd.DataFrame,
+) -> pd.DataFrame:
+    predictions = context.copy()
+    for outcome in OUTCOME_ORDER:
+        predictions[outcome_probability_column(outcome)] = probabilities[outcome].to_numpy(dtype=float)
+    probability_sum = predictions[[outcome_probability_column(outcome) for outcome in OUTCOME_ORDER]].sum(axis=1)
+    for outcome in OUTCOME_ORDER:
+        column = outcome_probability_column(outcome)
+        predictions[column] = predictions[column] / probability_sum
+    predictions["baseline"] = baseline_name
+    predictions["predicted_outcome"] = predictions[
+        [outcome_probability_column(outcome) for outcome in OUTCOME_ORDER]
+    ].idxmax(axis=1).map(
+        {
+            "home_win_probability": "home_win",
+            "draw_probability": "draw",
+            "away_win_probability": "away_win",
+        }
+    )
+    predictions["actual_outcome_probability"] = [
+        row[outcome_probability_column(row["actual_outcome"])]
+        for _, row in predictions.iterrows()
+    ]
+    predictions["outcome_log_loss"] = -np.log(predictions["actual_outcome_probability"].map(safe_probability))
+    predictions["rps"] = [
+        ranked_probability_score(
+            {outcome: row[outcome_probability_column(outcome)] for outcome in OUTCOME_ORDER},
+            row["actual_outcome"],
+        )
+        for _, row in predictions.iterrows()
+    ]
+    predictions["outcome_brier_score"] = [
+        sum(
+            (row[outcome_probability_column(outcome)] - float(outcome == row["actual_outcome"])) ** 2
+            for outcome in OUTCOME_ORDER
+        )
+        for _, row in predictions.iterrows()
+    ]
+    predictions["outcome_correct"] = predictions["predicted_outcome"].eq(predictions["actual_outcome"]).astype(int)
+    return predictions
+
+
+def constant_outcome_baseline(train: pd.DataFrame, evaluation: pd.DataFrame) -> pd.DataFrame:
+    train_context = build_match_context(train)
+    evaluation_context = build_match_context(evaluation)
+    counts = train_context["actual_outcome"].value_counts().reindex(OUTCOME_ORDER).fillna(0) + 1.0
+    probabilities = counts / counts.sum()
+    probability_frame = pd.DataFrame(
+        [probabilities.to_dict()] * len(evaluation_context),
+        columns=OUTCOME_ORDER,
+    )
+    return finalize_baseline_predictions("constant_outcome", evaluation_context, probability_frame)
+
+
+def constant_goal_poisson_baseline(train: pd.DataFrame, evaluation: pd.DataFrame, max_goals: int) -> pd.DataFrame:
+    train_home = train[train["is_listed_home"].eq(1)]
+    train_away = train[train["is_listed_home"].eq(0)]
+    lambda_home = float(train_home["goals_for"].mean())
+    lambda_away = float(train_away["goals_for"].mean())
+    context = build_match_context(evaluation)
+    score_matrix = poisson_score_matrix(lambda_home, lambda_away, max_goals=max_goals)
+    outcomes = outcome_probabilities(score_matrix)
+    probability_frame = pd.DataFrame(
+        [outcomes] * len(context),
+        columns=OUTCOME_ORDER,
+    )
+    return finalize_baseline_predictions("constant_goal_poisson", context, probability_frame)
+
+
+def elo_logistic_baseline(train: pd.DataFrame, evaluation: pd.DataFrame) -> pd.DataFrame:
+    train_context = build_match_context(train)
+    evaluation_context = build_match_context(evaluation)
+    outcome_codes = {outcome: index for index, outcome in enumerate(OUTCOME_ORDER)}
+    y = train_context["actual_outcome"].map(outcome_codes).astype(int)
+    x_train = sm.add_constant(pd.DataFrame({"elo_diff_scaled": train_context["home_elo_diff"] / 400.0}), has_constant="add")
+    x_eval = sm.add_constant(pd.DataFrame({"elo_diff_scaled": evaluation_context["home_elo_diff"] / 400.0}), has_constant="add")
+    try:
+        model = sm.MNLogit(y, x_train)
+        result = model.fit_regularized(alpha=0.01, L1_wt=0.0, disp=False, maxiter=200)
+        predicted = result.predict(x_eval)
+        probability_frame = pd.DataFrame(np.asarray(predicted, dtype=float), columns=OUTCOME_ORDER)
+        if not np.isfinite(probability_frame.to_numpy(dtype=float)).all():
+            raise ValueError("non-finite Elo logistic probabilities")
+    except Exception:
+        return constant_outcome_baseline(train, evaluation).assign(baseline="elo_logistic_failed_constant")
+    return finalize_baseline_predictions("elo_logistic", evaluation_context, probability_frame)
+
+
+def build_baseline_predictions(train: pd.DataFrame, evaluation: pd.DataFrame, max_goals: int) -> pd.DataFrame:
+    baselines = [
+        constant_outcome_baseline(train, evaluation),
+        constant_goal_poisson_baseline(train, evaluation, max_goals=max_goals),
+        elo_logistic_baseline(train, evaluation),
+    ]
+    return pd.concat(baselines, ignore_index=True)
+
+
+def aggregate_outcome_metrics(data: pd.DataFrame, label: str, split_name: str) -> dict[str, object]:
+    return {
+        "split": split_name,
+        "model_or_baseline": label,
+        "matches": int(len(data)),
+        "outcome_accuracy": float(data["outcome_correct"].mean()),
+        "outcome_log_loss": float(data["outcome_log_loss"].mean()),
+        "outcome_brier_score": float(data["outcome_brier_score"].mean()),
+        "rps": float(data["rps"].mean()),
+        "avg_actual_outcome_probability": float(data["actual_outcome_probability"].mean()),
+    }
+
+
+def baseline_comparison(split_name: str, match_predictions: pd.DataFrame, baselines: pd.DataFrame) -> pd.DataFrame:
+    rows = [aggregate_outcome_metrics(match_predictions, "poisson_glm", split_name)]
+    for baseline_name, group in baselines.groupby("baseline", sort=False):
+        rows.append(aggregate_outcome_metrics(group, baseline_name, split_name))
+    return pd.DataFrame(rows)
+
+
+def paired_comparison_tests(split_name: str, match_predictions: pd.DataFrame, baselines: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    model = match_predictions.set_index("match_id")
+    for baseline_name, baseline_group in baselines.groupby("baseline", sort=False):
+        baseline = baseline_group.set_index("match_id").reindex(model.index)
+        for metric in ["outcome_log_loss", "rps"]:
+            model_values = model[metric].to_numpy(dtype=float)
+            baseline_values = baseline[metric].to_numpy(dtype=float)
+            diff = model_values - baseline_values
+            t_p = float(ttest_rel(model_values, baseline_values, nan_policy="omit").pvalue)
+            try:
+                w_p = float(wilcoxon(diff).pvalue) if not np.allclose(diff, 0) else 1.0
+            except ValueError:
+                w_p = np.nan
+            rows.append(
+                {
+                    "split": split_name,
+                    "baseline": baseline_name,
+                    "metric": metric,
+                    "mean_model_minus_baseline": float(np.nanmean(diff)),
+                    "paired_t_p_value": t_p,
+                    "wilcoxon_p_value": w_p,
+                }
+            )
+        model_correct = model["outcome_correct"].astype(bool)
+        baseline_correct = baseline["outcome_correct"].astype(bool)
+        model_only = int((model_correct & ~baseline_correct).sum())
+        baseline_only = int((~model_correct & baseline_correct).sum())
+        denominator = model_only + baseline_only
+        statistic = 0.0 if denominator == 0 else (abs(model_only - baseline_only) - 1.0) ** 2 / denominator
+        rows.append(
+            {
+                "split": split_name,
+                "baseline": baseline_name,
+                "metric": "outcome_accuracy_mcnemar",
+                "mean_model_minus_baseline": float(model_correct.mean() - baseline_correct.mean()),
+                "paired_t_p_value": float(chi2.sf(statistic, df=1)) if denominator else 1.0,
+                "wilcoxon_p_value": np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def per_outcome_metrics(split_name: str, match_predictions: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for outcome in OUTCOME_ORDER:
+        predicted = match_predictions["predicted_outcome"].eq(outcome)
+        actual = match_predictions["actual_outcome"].eq(outcome)
+        tp = int((predicted & actual).sum())
+        fp = int((predicted & ~actual).sum())
+        fn = int((~predicted & actual).sum())
+        support = int(actual.sum())
+        precision = tp / (tp + fp) if tp + fp else np.nan
+        recall = tp / (tp + fn) if tp + fn else np.nan
+        f1 = 2 * precision * recall / (precision + recall) if np.isfinite(precision) and np.isfinite(recall) and precision + recall else np.nan
+        rows.append(
+            {
+                "split": split_name,
+                "outcome": outcome,
+                "support": support,
+                "predicted_count": int(predicted.sum()),
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "mean_predicted_probability": float(match_predictions[outcome_probability_column(outcome)].mean()),
+                "actual_frequency": float(actual.mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def grouped_metrics(split_name: str, match_predictions: pd.DataFrame, group_column: str) -> pd.DataFrame:
+    rows = []
+    for value, group in match_predictions.groupby(group_column, dropna=False):
+        row = aggregate_outcome_metrics(group, "poisson_glm", split_name)
+        row["group"] = group_column
+        row["group_value"] = value
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def scoreline_confusion(split_name: str, match_predictions: pd.DataFrame, limit: int = 30) -> pd.DataFrame:
+    confusion = (
+        match_predictions.groupby(["top_scoreline", "actual_scoreline"], dropna=False)
+        .size()
+        .reset_index(name="matches")
+        .sort_values("matches", ascending=False)
+        .head(limit)
+    )
+    confusion.insert(0, "split", split_name)
+    return confusion
+
+
 def summary_row(
     *,
     split_name: str,
@@ -341,6 +695,7 @@ def summary_row(
     model_result,
 ) -> dict[str, object]:
     weight_summary = getattr(model_result, "sample_weight_summary", {}) or {}
+    regularization = getattr(model_result, "regularization_summary", {}) or {}
     return {
         "split": split_name,
         "max_goals": max_goals,
@@ -359,17 +714,25 @@ def summary_row(
         "kyrre_weight_half_life_years": weight_summary.get("kyrre_weight_half_life_years", ""),
         "kyrre_weight_reference_date": weight_summary.get("kyrre_weight_reference_date", ""),
         "weight_sum": weight_summary.get("weight_sum", ""),
+        "fit_method": regularization.get("fit_method", ""),
+        "ridge_alpha": regularization.get("ridge_alpha", ""),
+        "tuned_config_source": getattr(model_result, "tuned_config_source", ""),
         "mean_poisson_nll": float(row_predictions["poisson_nll"].mean()),
+        "mean_poisson_deviance": float(row_predictions["poisson_deviance"].mean()),
         "goal_mae": float(row_predictions["absolute_error"].mean()),
         "goal_rmse": float(np.sqrt(row_predictions["squared_error"].mean())),
+        "within_one_goal_rate": float(row_predictions["within_one_goal"].mean()),
+        "goal_interval_95_coverage": float(row_predictions["goal_interval_95_contains"].mean()),
         "mean_predicted_goals": float(row_predictions["predicted_goals"].mean()),
         "mean_actual_goals": float(row_predictions["actual_goals"].mean()),
         "outcome_accuracy": float(match_predictions["outcome_correct"].mean()),
         "outcome_brier_score": float(match_predictions["outcome_brier_score"].mean()),
         "outcome_log_loss": float(match_predictions["outcome_log_loss"].mean()),
+        "rps": float(match_predictions["rps"].mean()),
         "avg_actual_outcome_probability": float(match_predictions["actual_outcome_probability"].mean()),
         "exact_score_top1_accuracy": float(match_predictions["exact_score_top1_correct"].mean()),
         "mean_exact_score_probability": float(match_predictions["exact_score_probability"].mean()),
+        "scoreline_within_one_goal_rate": float(match_predictions["scoreline_within_one_goal"].mean()),
         "mean_score_matrix_probability_mass": float(match_predictions["score_matrix_probability_mass"].mean()),
     }
 
@@ -474,12 +837,62 @@ def plot_worst_log_loss(match_predictions: pd.DataFrame, split_name: str, path: 
     plt.close(fig)
 
 
+def plot_reliability(reliability: pd.DataFrame, split_name: str, path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for outcome, group in reliability.groupby("outcome", sort=False):
+        ax.plot(
+            group["mean_predicted_probability"],
+            group["empirical_frequency"],
+            marker="o",
+            label=outcome,
+        )
+    ax.plot([0, 1], [0, 1], color="#333333", linestyle="--", linewidth=1)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Empirical frequency")
+    ax.set_title(f"Outcome reliability: {split_name}")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def plot_yearly_metrics(yearly_metrics: pd.DataFrame, split_name: str, path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(yearly_metrics["group_value"], yearly_metrics["outcome_log_loss"], marker="o", label="Log-loss")
+    ax.plot(yearly_metrics["group_value"], yearly_metrics["rps"], marker="o", label="RPS")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Metric")
+    ax.set_title(f"Yearly probabilistic metrics: {split_name}")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def plot_subgroup_log_loss(subgroup_metrics: pd.DataFrame, split_name: str, path: Path) -> None:
+    plot_data = subgroup_metrics.copy()
+    plot_data["label"] = plot_data["group"] + "=" + plot_data["group_value"].astype(str)
+    plot_data = plot_data.sort_values("outcome_log_loss")
+    fig, ax = plt.subplots(figsize=(10, max(5, 0.35 * len(plot_data) + 1.5)))
+    ax.barh(plot_data["label"], plot_data["outcome_log_loss"], color="#276fbf")
+    ax.set_xlabel("Outcome log-loss")
+    ax.set_title(f"Subgroup log-loss: {split_name}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def display_summary(summary: pd.DataFrame) -> pd.DataFrame:
     percent_columns = {
         "outcome_accuracy",
+        "within_one_goal_rate",
+        "goal_interval_95_coverage",
         "avg_actual_outcome_probability",
         "exact_score_top1_accuracy",
         "mean_exact_score_probability",
+        "scoreline_within_one_goal_rate",
         "mean_score_matrix_probability_mass",
     }
     display = summary.copy()
@@ -492,9 +905,20 @@ def write_markdown_summary(
     *,
     path: Path,
     summary: pd.DataFrame,
+    model_weights: pd.DataFrame,
     outputs_by_split: dict[str, dict[str, pd.DataFrame]],
     artifacts: dict[str, Path],
 ) -> None:
+    top_weights = model_weights[model_weights["term"].ne("const")].head(20)[
+        [
+            "term",
+            "coefficient",
+            "std_error",
+            "p_value",
+            "standardized_coefficient",
+            "rate_ratio_per_1sd",
+        ]
+    ]
     lines = [
         "# V1 Fixed-Split Validation",
         "",
@@ -510,6 +934,15 @@ def write_markdown_summary(
         "## Summary Metrics",
         "",
         markdown_table(display_summary(summary)),
+        "",
+        "## Model Weights",
+        "",
+        "The chart `model_weights.png` shows standardized GLM coefficients:",
+        "`beta * training feature standard deviation`. This makes features with",
+        "different units easier to compare. Positive values increase expected",
+        "goals on the log scale; negative values decrease expected goals.",
+        "",
+        markdown_table(top_weights),
         "",
         "## Goal Calibration By Predicted Lambda Bin",
         "",
@@ -531,6 +964,12 @@ def write_markdown_summary(
                 "absolute_calibration_error",
             ]
         ]
+        baseline_summary = outputs["baseline_summary"]
+        paired_tests = outputs["paired_tests"]
+        ece = outputs["ece"]
+        per_outcome = outputs["per_outcome_metrics"]
+        subgroup = outputs["subgroup_metrics"].sort_values("outcome_log_loss", ascending=False).head(20)
+        scoreline = outputs["scoreline_confusion"].head(20)
         match_predictions = outputs["match_predictions"]
         worst = match_predictions.sort_values("outcome_log_loss", ascending=False).head(10)[
             [
@@ -549,6 +988,31 @@ def write_markdown_summary(
                 f"### {split_name}",
                 "",
                 markdown_table(goal_calibration),
+                "",
+                f"## Baseline Comparison: {split_name}",
+                "",
+                markdown_table(
+                    baseline_summary,
+                    percent_columns={"outcome_accuracy", "avg_actual_outcome_probability"},
+                ),
+                "",
+                f"## Paired Baseline Tests: {split_name}",
+                "",
+                markdown_table(paired_tests),
+                "",
+                f"## Outcome Calibration And Per-Class Metrics: {split_name}",
+                "",
+                markdown_table(ece),
+                "",
+                markdown_table(per_outcome, percent_columns={"precision", "recall", "f1", "actual_frequency"}),
+                "",
+                f"## Highest-Loss Subgroups: {split_name}",
+                "",
+                markdown_table(subgroup, percent_columns={"outcome_accuracy", "avg_actual_outcome_probability"}),
+                "",
+                f"## Frequent Scoreline Confusions: {split_name}",
+                "",
+                markdown_table(scoreline),
                 "",
                 f"## Worst Outcome Log-Loss Matches: {split_name}",
                 "",
@@ -572,28 +1036,55 @@ def write_reports(
     *,
     output_dir: Path,
     summary: pd.DataFrame,
+    model_result,
     outputs_by_split: dict[str, dict[str, pd.DataFrame]],
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts = {
         "validation_summary_md": output_dir / "validation_summary.md",
         "validation_summary_csv": output_dir / "validation_summary.csv",
+        "model_weights_csv": output_dir / "model_weights.csv",
+        "model_weights_png": output_dir / "model_weights.png",
     }
     summary.to_csv(artifacts["validation_summary_csv"], index=False)
+    weights = model_weights_table(model_result)
+    weights.to_csv(artifacts["model_weights_csv"], index=False)
+    plot_model_weights(weights, artifacts["model_weights_png"])
 
     for split_name, outputs in outputs_by_split.items():
         artifacts[f"{split_name}_match_predictions_csv"] = output_dir / f"{split_name}_match_predictions.csv"
         artifacts[f"{split_name}_row_predictions_csv"] = output_dir / f"{split_name}_row_predictions.csv"
         artifacts[f"{split_name}_goal_calibration_csv"] = output_dir / f"{split_name}_goal_calibration.csv"
+        artifacts[f"{split_name}_baseline_predictions_csv"] = output_dir / f"{split_name}_baseline_predictions.csv"
+        artifacts[f"{split_name}_baseline_summary_csv"] = output_dir / f"{split_name}_baseline_summary.csv"
+        artifacts[f"{split_name}_paired_tests_csv"] = output_dir / f"{split_name}_paired_tests.csv"
+        artifacts[f"{split_name}_per_outcome_metrics_csv"] = output_dir / f"{split_name}_per_outcome_metrics.csv"
+        artifacts[f"{split_name}_reliability_csv"] = output_dir / f"{split_name}_reliability.csv"
+        artifacts[f"{split_name}_ece_csv"] = output_dir / f"{split_name}_ece.csv"
+        artifacts[f"{split_name}_yearly_metrics_csv"] = output_dir / f"{split_name}_yearly_metrics.csv"
+        artifacts[f"{split_name}_subgroup_metrics_csv"] = output_dir / f"{split_name}_subgroup_metrics.csv"
+        artifacts[f"{split_name}_scoreline_confusion_csv"] = output_dir / f"{split_name}_scoreline_confusion.csv"
         artifacts[f"{split_name}_predicted_vs_actual_goals_png"] = output_dir / f"{split_name}_predicted_vs_actual_goals.png"
         artifacts[f"{split_name}_goal_calibration_png"] = output_dir / f"{split_name}_goal_calibration.png"
         artifacts[f"{split_name}_outcome_probability_bars_png"] = output_dir / f"{split_name}_outcome_probability_bars.png"
         artifacts[f"{split_name}_outcome_confusion_matrix_png"] = output_dir / f"{split_name}_outcome_confusion_matrix.png"
         artifacts[f"{split_name}_worst_match_log_loss_png"] = output_dir / f"{split_name}_worst_match_log_loss.png"
+        artifacts[f"{split_name}_reliability_png"] = output_dir / f"{split_name}_reliability.png"
+        artifacts[f"{split_name}_yearly_metrics_png"] = output_dir / f"{split_name}_yearly_metrics.png"
+        artifacts[f"{split_name}_subgroup_log_loss_png"] = output_dir / f"{split_name}_subgroup_log_loss.png"
 
         outputs["match_predictions"].to_csv(artifacts[f"{split_name}_match_predictions_csv"], index=False)
         outputs["row_predictions"].to_csv(artifacts[f"{split_name}_row_predictions_csv"], index=False)
         outputs["goal_calibration"].to_csv(artifacts[f"{split_name}_goal_calibration_csv"], index=False)
+        outputs["baseline_predictions"].to_csv(artifacts[f"{split_name}_baseline_predictions_csv"], index=False)
+        outputs["baseline_summary"].to_csv(artifacts[f"{split_name}_baseline_summary_csv"], index=False)
+        outputs["paired_tests"].to_csv(artifacts[f"{split_name}_paired_tests_csv"], index=False)
+        outputs["per_outcome_metrics"].to_csv(artifacts[f"{split_name}_per_outcome_metrics_csv"], index=False)
+        outputs["reliability"].to_csv(artifacts[f"{split_name}_reliability_csv"], index=False)
+        outputs["ece"].to_csv(artifacts[f"{split_name}_ece_csv"], index=False)
+        outputs["yearly_metrics"].to_csv(artifacts[f"{split_name}_yearly_metrics_csv"], index=False)
+        outputs["subgroup_metrics"].to_csv(artifacts[f"{split_name}_subgroup_metrics_csv"], index=False)
+        outputs["scoreline_confusion"].to_csv(artifacts[f"{split_name}_scoreline_confusion_csv"], index=False)
         plot_predicted_vs_actual(
             outputs["row_predictions"],
             split_name,
@@ -619,10 +1110,26 @@ def write_reports(
             split_name,
             artifacts[f"{split_name}_worst_match_log_loss_png"],
         )
+        plot_reliability(
+            outputs["reliability"],
+            split_name,
+            artifacts[f"{split_name}_reliability_png"],
+        )
+        plot_yearly_metrics(
+            outputs["yearly_metrics"],
+            split_name,
+            artifacts[f"{split_name}_yearly_metrics_png"],
+        )
+        plot_subgroup_log_loss(
+            outputs["subgroup_metrics"],
+            split_name,
+            artifacts[f"{split_name}_subgroup_log_loss_png"],
+        )
 
     write_markdown_summary(
         path=artifacts["validation_summary_md"],
         summary=summary,
+        model_weights=weights,
         outputs_by_split=outputs_by_split,
         artifacts=artifacts,
     )
@@ -632,7 +1139,19 @@ def write_reports(
 def print_console_report(summary: pd.DataFrame, outputs_by_split: dict[str, dict[str, pd.DataFrame]], artifacts: dict[str, Path]) -> None:
     print("\nValidation/test summary")
     print(display_summary(summary).to_string(index=False))
+    weights = pd.read_csv(artifacts["model_weights_csv"])
+    top_weights = weights[weights["term"].ne("const")].head(12)[
+        ["term", "coefficient", "standardized_coefficient", "rate_ratio_per_1sd", "p_value"]
+    ]
+    print("\nLargest standardized model weights")
+    print(top_weights.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
     for split_name, outputs in outputs_by_split.items():
+        print(f"\nBaseline comparison: {split_name}")
+        print(display_summary(outputs["baseline_summary"]).to_string(index=False))
+
+        print(f"\nOutcome ECE: {split_name}")
+        print(outputs["ece"].to_string(index=False, float_format=lambda value: f"{value:.6f}"))
+
         print(f"\nGoal calibration by predicted lambda bin: {split_name}")
         calibration_display = outputs["goal_calibration"][
             [
@@ -724,8 +1243,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kyrre-weight-half-life-years",
         type=float,
-        default=DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS,
-        help="Half-life in years for Kyrre training weights. Defaults to 8.",
+        default=None,
+        help="Half-life in years for Kyrre training weights. Defaults to tuned config, then 8.",
     )
     parser.add_argument(
         "--kyrre-weight-gamma",
@@ -739,6 +1258,23 @@ def parse_args() -> argparse.Namespace:
         help="Disable Kyrre-weighted likelihood fitting.",
     )
     parser.add_argument(
+        "--ridge-alpha",
+        type=float,
+        default=None,
+        help="L2 ridge penalty strength. Defaults to tuned config, then 0.01. Use 0 for unregularized GLM.",
+    )
+    parser.add_argument(
+        "--tuned-config",
+        type=Path,
+        default=DEFAULT_TUNED_CONFIG_PATH,
+        help="Path to tuned Poisson GLM hyperparameter config.",
+    )
+    parser.add_argument(
+        "--ignore-tuned-config",
+        action="store_true",
+        help="Ignore tuned config and use fallback defaults unless explicit flags are supplied.",
+    )
+    parser.add_argument(
         "--features",
         nargs="+",
         default=DEFAULT_FEATURE_COLUMNS,
@@ -750,6 +1286,7 @@ def parse_args() -> argparse.Namespace:
 def evaluate_split(
     model_result,
     split_name: str,
+    train: pd.DataFrame,
     data: pd.DataFrame,
     max_goals: int,
     calibration_bin_width: float,
@@ -757,16 +1294,60 @@ def evaluate_split(
     row_predictions = add_row_predictions(model_result, data)
     match_predictions = build_match_predictions(row_predictions, max_goals=max_goals)
     goal_calibration = build_goal_calibration(row_predictions, bin_width=calibration_bin_width)
+    baselines = build_baseline_predictions(train, data, max_goals=max_goals)
+    baseline_summary = baseline_comparison(split_name, match_predictions, baselines)
+    paired_tests = paired_comparison_tests(split_name, match_predictions, baselines)
+    reliability, ece = outcome_ece(match_predictions)
+    reliability.insert(0, "split", split_name)
+    ece.insert(0, "split", split_name)
+    per_outcome = per_outcome_metrics(split_name, match_predictions)
+    yearly = grouped_metrics(split_name, match_predictions, "year")
+    subgroups = pd.concat(
+        [
+            grouped_metrics(split_name, match_predictions, "is_neutral"),
+            grouped_metrics(split_name, match_predictions, "is_world_cup"),
+            grouped_metrics(split_name, match_predictions, "favorite_bucket"),
+            grouped_metrics(split_name, match_predictions, "tournament_type"),
+        ],
+        ignore_index=True,
+    )
+    scoreline = scoreline_confusion(split_name, match_predictions)
     return {
         "row_predictions": row_predictions,
         "match_predictions": match_predictions,
         "goal_calibration": goal_calibration,
+        "baseline_predictions": baselines,
+        "baseline_summary": baseline_summary,
+        "paired_tests": paired_tests,
+        "reliability": reliability,
+        "ece": ece,
+        "per_outcome_metrics": per_outcome,
+        "yearly_metrics": yearly,
+        "subgroup_metrics": subgroups,
+        "scoreline_confusion": scoreline,
     }
 
 
 def main() -> None:
     args = parse_args()
     data = load_training_data(args.training_csv)
+    tuned_config = load_tuned_config(
+        args.tuned_config,
+        feature_columns=args.features,
+        ignore=args.ignore_tuned_config,
+    )
+    ridge_alpha = (
+        float(args.ridge_alpha)
+        if args.ridge_alpha is not None
+        else float(tuned_config.get("ridge_alpha", DEFAULT_RIDGE_ALPHA))
+    )
+    if args.no_kyrre_weight:
+        kyrre_half_life = None
+    elif args.kyrre_weight_half_life_years is not None:
+        kyrre_half_life = float(args.kyrre_weight_half_life_years)
+    else:
+        tuned_half_life = tuned_config.get("kyrre_weight_half_life_years", DEFAULT_KYRRE_WEIGHT_HALF_LIFE_YEARS)
+        kyrre_half_life = None if tuned_half_life is None else float(tuned_half_life)
     train, validation, test = split_fixed_periods(
         data,
         train_start=args.train_start,
@@ -784,15 +1365,16 @@ def main() -> None:
         print_diagnostics=True,
         date_column="date",
         kyrre_weight_gamma=None if args.no_kyrre_weight else args.kyrre_weight_gamma,
-        kyrre_weight_half_life_years=(
-            None if args.no_kyrre_weight else args.kyrre_weight_half_life_years
-        ),
+        kyrre_weight_half_life_years=kyrre_half_life,
+        ridge_alpha=ridge_alpha,
     )
+    model_result.tuned_config_source = str(tuned_config.get("source", ""))
 
     outputs_by_split = {
         "validation_2019_2021": evaluate_split(
             model_result,
             "validation_2019_2021",
+            train,
             validation,
             args.max_goals,
             args.calibration_bin_width,
@@ -800,6 +1382,7 @@ def main() -> None:
         "test_2022_world_cup": evaluate_split(
             model_result,
             "test_2022_world_cup",
+            train,
             test,
             args.max_goals,
             args.calibration_bin_width,
@@ -851,6 +1434,7 @@ def main() -> None:
     artifacts = write_reports(
         output_dir=args.output_dir,
         summary=summary,
+        model_result=model_result,
         outputs_by_split=outputs_by_split,
     )
     print_console_report(summary, outputs_by_split, artifacts)
